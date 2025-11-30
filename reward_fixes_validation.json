@@ -1,0 +1,24 @@
+{
+  "reward_test": {
+    "episode_length": 76,
+    "survival_penalty_rate": 0.0,
+    "pellets_collected": 14,
+    "collection_rate": 0.18421052631578946,
+    "positive_reward_rate": 0.18421052631578946,
+    "negative_reward_rate": 0.8157894736842105,
+    "final_outcome": -1000
+  },
+  "termination_test": {
+    "episode_length": 350,
+    "terminated_early": false,
+    "final_reward": -1.0
+  },
+  "epsilon_test": {
+    "final_epsilon": 0.25,
+    "min_epsilon": 0.15,
+    "episodes_with_low_exploration": 0,
+    "episodes_with_good_exploration": 803
+  },
+  "overall_score": 0.5,
+  "timestamp": 1764481866.5065203
+}

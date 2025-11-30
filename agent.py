@@ -15,6 +15,119 @@ if torch.cuda.is_available():
 else:
     print("Using device: CPU")
 
+PERCEPTION_RADIUS = 2
+PERCEPTION_DIAMETER = PERCEPTION_RADIUS * 2 + 1
+PERCEPTION_AREA = PERCEPTION_DIAMETER ** 2
+PERCEPTION_CHANNELS = 3
+PACMAN_GHOST_FEATURES = 5  # dx, dy, distance, vulnerability, visibility
+PACMAN_HUNGER_PROGRESS_DIM = 6  # hunger meter, idle, score-freeze, pellet, power, unique ratios
+PACMAN_STATE_DIM = PERCEPTION_AREA * PERCEPTION_CHANNELS + PACMAN_GHOST_FEATURES * 4 + PACMAN_HUNGER_PROGRESS_DIM
+GHOST_ADDITIONAL_FEATURES = 15  # see GhostTeam.get_ghost_state docstring
+GHOST_STATE_DIM = PERCEPTION_AREA * PERCEPTION_CHANNELS + GHOST_ADDITIONAL_FEATURES
+GLOBAL_STATE_DIM = 18
+MAX_VISIBILITY_DEPTH = 12
+
+
+def _get_maze_dimensions(game_state):
+    dims = game_state.get('dimensions', {}) or {}
+    height = dims.get('height', 31)
+    width = dims.get('width', 28)
+    diag = math.sqrt(height ** 2 + width ** 2)
+    return height, width, diag
+
+
+def _safe_ratio(value, denom):
+    if denom is None or denom <= 0:
+        return 0.0
+    return float(np.clip(value / denom, 0.0, 1.0))
+
+
+def _hunger_meter_ratio(hunger_meter, hunger_config):
+    limit = hunger_config.get('hunger_termination_limit', -150.0)
+    if limit >= 0:
+        return float(np.clip(hunger_meter / max(limit, 1.0), 0.0, 1.0))
+    return float(np.clip(1.0 - (hunger_meter / limit), 0.0, 1.0))
+
+
+def _extract_hunger_features(game_state):
+    hunger_stats = game_state.get('hunger_stats', {}) or {}
+    hunger_config = game_state.get('hunger_config', {}) or {}
+    idle_threshold = max(hunger_config.get('hunger_idle_threshold', 1), 1)
+    survival_grace = max(hunger_config.get('survival_grace_steps', 1), 1)
+    stagnation_window = max(hunger_config.get('stagnation_tile_window', 1), 1)
+    hunger_meter = hunger_stats.get('hunger_meter', 0.0)
+    hunger_ratio = _hunger_meter_ratio(hunger_meter, hunger_config)
+    steps_ratio = _safe_ratio(hunger_stats.get('steps_since_progress', 0), idle_threshold)
+    score_freeze_ratio = _safe_ratio(hunger_stats.get('score_freeze_steps', 0), survival_grace)
+    unique_ratio = _safe_ratio(hunger_stats.get('unique_tiles', 0), stagnation_window)
+    return hunger_ratio, steps_ratio, score_freeze_ratio, unique_ratio
+
+
+def _pellet_progress_features(game_state):
+    pellets = game_state.get('pellets', set()) or set()
+    power_pellets = game_state.get('power_pellets', set()) or set()
+    initial_counts = game_state.get('initial_counts', {}) or {}
+    pellet_total = initial_counts.get('pellets', len(pellets))
+    power_total = initial_counts.get('power_pellets', len(power_pellets))
+    pellet_ratio = _safe_ratio(len(pellets), pellet_total)
+    power_ratio = _safe_ratio(len(power_pellets), power_total)
+    return pellet_ratio, power_ratio
+
+
+def _build_local_grid(game_state, center):
+    walls = game_state.get('walls', set()) or set()
+    pellets = game_state.get('pellets', set()) or set()
+    power_pellets = game_state.get('power_pellets', set()) or set()
+    height, width, _ = _get_maze_dimensions(game_state)
+    features = []
+    for dr in range(-PERCEPTION_RADIUS, PERCEPTION_RADIUS + 1):
+        for dc in range(-PERCEPTION_RADIUS, PERCEPTION_RADIUS + 1):
+            row = center[0] + dr
+            col = center[1] + dc
+            out_of_bounds = row < 0 or row >= height or col < 0 or col >= width
+            if out_of_bounds:
+                features.extend([1.0, 0.0, 0.0])
+            else:
+                cell = (row, col)
+                features.extend([
+                    1.0 if cell in walls else 0.0,
+                    1.0 if cell in pellets else 0.0,
+                    1.0 if cell in power_pellets else 0.0
+                ])
+    return features
+
+
+def _bfs_distance(start, target, walls, width, height, max_depth=MAX_VISIBILITY_DEPTH):
+    if start == target:
+        return 0
+    visited = {start}
+    queue = deque([(start, 0)])
+    while queue:
+        (row, col), dist = queue.popleft()
+        if dist >= max_depth:
+            continue
+        for nr, nc in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+            if not (0 <= nr < height and 0 <= nc < width):
+                continue
+            if (nr, nc) in walls or (nr, nc) in visited:
+                continue
+            next_dist = dist + 1
+            if (nr, nc) == target:
+                return next_dist
+            visited.add((nr, nc))
+            queue.append(((nr, nc), next_dist))
+    return None
+
+
+def _normalize_velocity(velocity):
+    if not velocity:
+        return 0.0, 0.0
+    return (
+        float(np.clip(velocity[0], -1, 1)),
+        float(np.clip(velocity[1], -1, 1))
+    )
+
+
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=128):
         super(ActorCritic, self).__init__()
@@ -73,9 +186,11 @@ class PPOAgent:
         self.mse_loss = nn.MSELoss()
         
         # Dynamic entropy coefficient
-        self.entropy_coef = 0.01
-        self.min_entropy_coef = 0.001
-        self.entropy_decay = 0.9995
+        self.entropy_coef = 0.02
+        self.min_entropy_coef = 0.005
+        self.entropy_decay = 0.999
+        self.dirichlet_alpha = 2.0
+        self.dirichlet_mix = 0.12
         
         # Memory
         self.states = []
@@ -96,6 +211,12 @@ class PPOAgent:
             state = torch.FloatTensor(state).unsqueeze(0).to(device)
             # Maintain hidden state across timesteps within episode
             action_probs, state_value = self.policy_old(state, self.policy_old.hidden_cell)
+            if self.dirichlet_mix > 0:
+                concentration = torch.full((action_probs.shape[-1],), self.dirichlet_alpha, device=action_probs.device)
+                noise = torch.distributions.Dirichlet(concentration).sample().unsqueeze(0)
+                action_probs = (1 - self.dirichlet_mix) * action_probs + self.dirichlet_mix * noise
+                action_probs = torch.clamp(action_probs, 1e-6, 1.0)
+                action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
             dist = Categorical(action_probs)
             action = dist.sample()
             action_logprob = dist.log_prob(action)
@@ -424,8 +545,8 @@ class ICM(nn.Module):
 
 class QMIXAgent:
     """QMIX with prioritized replay, ICM, and learning rate scheduling"""
-    def __init__(self, n_agents=4, state_dim=4, global_state_dim=10, action_dim=4, 
-                 lr=5e-4, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.05):
+    def __init__(self, n_agents=4, state_dim=GHOST_STATE_DIM, global_state_dim=GLOBAL_STATE_DIM, action_dim=4, 
+                 lr=5e-4, gamma=0.99, epsilon=1.0, epsilon_decay=0.997, epsilon_min=0.15):
         self.n_agents = n_agents
         self.action_dim = action_dim
         self.gamma = gamma
@@ -487,7 +608,7 @@ class QMIXAgent:
     def store_transition(self, states, actions, reward, next_states, done, global_state, next_global_state):
         self.memory.push(states, actions, reward, next_states, done, global_state, next_global_state)
     
-    def update(self):
+    def update(self, done=False):
         if len(self.memory) < self.batch_size:
             return
         
@@ -591,8 +712,26 @@ class QMIXAgent:
         # Update learning rate
         self.scheduler.step()
         
-        # Decay epsilon
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        # Decay epsilon ONLY at episode boundaries (when done=True)
+        if done:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+            
+            # ADDED: Exploration monitoring and periodic boosts
+            self.episode_count = getattr(self, 'episode_count', 0) + 1
+            
+            # Periodic exploration boost every 1000 episodes
+            if self.episode_count % 1000 == 0:
+                self.epsilon = min(0.3, self.epsilon + 0.1)  # Boost exploration
+                print(f"Exploration boost at episode {self.episode_count}: epsilon = {self.epsilon:.3f}")
+            
+            # Store epsilon history for analysis
+            if not hasattr(self, 'epsilon_history'):
+                self.epsilon_history = []
+            self.epsilon_history.append(self.epsilon)
+            
+            # Alert if epsilon drops too low
+            if self.epsilon < 0.1 and self.episode_count % 100 == 0:
+                print(f"WARNING: Low exploration at episode {self.episode_count}: epsilon = {self.epsilon:.3f}")
     
     def update_target_networks(self):
         for i in range(self.n_agents):
@@ -611,8 +750,8 @@ class QMIXAgent:
 
 class PacmanAgent:
     def __init__(self):
-        # State: [ghost_dx, ghost_dy, food_dx, food_dy, ghost_dist, vulnerable]
-        self.agent = PPOAgent(state_dim=6, action_dim=4)
+        # State: local 5x5 perception (walls/pellets/power), per-ghost embeddings, hunger + progress cues
+        self.agent = PPOAgent(state_dim=PACMAN_STATE_DIM, action_dim=4)
         self.last_state = None
         self.last_action = None
         self.last_logprob = None
@@ -622,42 +761,35 @@ class PacmanAgent:
         pacman = game_state['pacman']
         ghosts = game_state['ghosts']
         vulnerable = game_state['ghost_vulnerable']
-        
-        # Find nearest ghost
-        nearest_ghost_dist = float('inf')
-        nearest_ghost_dir = [0, 0]
-        nearest_vulnerable = 0
-        
+        hunger_ratio, steps_ratio, score_freeze_ratio, unique_ratio = _extract_hunger_features(game_state)
+        pellet_ratio, power_ratio = _pellet_progress_features(game_state)
+        height, width, diag = _get_maze_dimensions(game_state)
+        walls = game_state.get('walls', set()) or set()
+        perception = _build_local_grid(game_state, pacman)
+        ghost_features = []
         for i, ghost in enumerate(ghosts):
-            dist = abs(ghost[0] - pacman[0]) + abs(ghost[1] - pacman[1])
-            if dist < nearest_ghost_dist:
-                nearest_ghost_dist = dist
-                nearest_ghost_dir = [ghost[0] - pacman[0], ghost[1] - pacman[1]]
-                nearest_vulnerable = 1 if vulnerable[i] else 0
-        
-        # Normalize ghost direction
-        if nearest_ghost_dist > 0:
-            nearest_ghost_dir = [nearest_ghost_dir[0] / 10.0, nearest_ghost_dir[1] / 10.0]
-        
-        # Find nearest food
-        all_food = list(game_state['pellets']) + list(game_state['power_pellets'])
-        if all_food:
-            nearest_food = min(all_food, key=lambda p: abs(p[0] - pacman[0]) + abs(p[1] - pacman[1]))
-            food_dir = [nearest_food[0] - pacman[0], nearest_food[1] - pacman[1]]
-            food_dist = abs(food_dir[0]) + abs(food_dir[1])
-            if food_dist > 0:
-                food_dir = [food_dir[0] / 10.0, food_dir[1] / 10.0]
-        else:
-            food_dir = [0, 0]
-        
-        # Normalize distance
-        dist_normalized = min(nearest_ghost_dist / 20.0, 1.0)
-        
-        return np.array([
-            nearest_ghost_dir[0], nearest_ghost_dir[1],
-            food_dir[0], food_dir[1],
-            dist_normalized, nearest_vulnerable
-        ], dtype=np.float32)
+            rel_row = (ghost[0] - pacman[0]) / max(height, 1)
+            rel_col = (ghost[1] - pacman[1]) / max(width, 1)
+            manhattan = abs(ghost[0] - pacman[0]) + abs(ghost[1] - pacman[1])
+            manhattan_norm = min(manhattan / max(diag, 1.0), 1.0)
+            visibility_dist = _bfs_distance(tuple(pacman), tuple(ghost), walls, width, height)
+            visible_flag = 1.0 if visibility_dist is not None else 0.0
+            ghost_features.extend([
+                rel_row,
+                rel_col,
+                manhattan_norm,
+                1.0 if vulnerable[i] else 0.0,
+                visible_flag
+            ])
+        features = perception + ghost_features + [
+            hunger_ratio,
+            steps_ratio,
+            score_freeze_ratio,
+            pellet_ratio,
+            power_ratio,
+            unique_ratio
+        ]
+        return np.array(features, dtype=np.float32)
     
     def get_action(self, state):
         action, logprob, value = self.agent.get_action(state)
@@ -680,58 +812,109 @@ class PacmanAgent:
 class GhostTeam:
     """Coordinated ghost team using QMIX"""
     def __init__(self):
-        self.qmix = QMIXAgent(n_agents=4, state_dim=4, global_state_dim=10)
+        self.qmix = QMIXAgent(n_agents=4, state_dim=GHOST_STATE_DIM, global_state_dim=GLOBAL_STATE_DIM)
         self.update_counter = 0
         self.target_update_freq = 100
     
     def get_ghost_state(self, game_state, ghost_id):
-        """Get individual ghost state"""
-        ghost_pos = game_state['ghosts'][ghost_id]
+        """Get individual ghost observation with local context and team/power cues"""
+        ghosts = game_state['ghosts']
+        ghost_pos = ghosts[ghost_id]
         pacman = game_state['pacman']
-        vulnerable = game_state['ghost_vulnerable'][ghost_id]
-        
-        # Relative position to Pacman
-        rel_pos = [pacman[0] - ghost_pos[0], pacman[1] - ghost_pos[1]]
-        distance = abs(rel_pos[0]) + abs(rel_pos[1])
-        
-        # Normalize
-        if distance > 0:
-            rel_pos = [rel_pos[0] / 10.0, rel_pos[1] / 10.0]
-        dist_normalized = min(distance / 20.0, 1.0)
-        
-        return np.array([
-            rel_pos[0], rel_pos[1],
-            dist_normalized, 1 if vulnerable else 0
-        ], dtype=np.float32)
+        vulnerable = 1.0 if game_state['ghost_vulnerable'][ghost_id] else 0.0
+        height, width, diag = _get_maze_dimensions(game_state)
+        walls = game_state.get('walls', set()) or set()
+        local_grid = _build_local_grid(game_state, ghost_pos)
+        rel_row = (pacman[0] - ghost_pos[0]) / max(height, 1)
+        rel_col = (pacman[1] - ghost_pos[1]) / max(width, 1)
+        manhattan = abs(pacman[0] - ghost_pos[0]) + abs(pacman[1] - ghost_pos[1])
+        manhattan_norm = min(manhattan / max(diag, 1.0), 1.0)
+        visibility_dist = _bfs_distance(tuple(ghost_pos), tuple(pacman), walls, width, height)
+        visible_flag = 1.0 if visibility_dist is not None else 0.0
+        visible_distance_norm = min(visibility_dist / max(diag, 1.0), 1.0) if visibility_dist is not None else 0.0
+        vel_row, vel_col = _normalize_velocity(game_state.get('pacman_velocity', (0, 0)))
+        power_pellets = game_state.get('power_pellets', set()) or set()
+        if power_pellets:
+            nearest_power = min(
+                power_pellets,
+                key=lambda p: abs(p[0] - ghost_pos[0]) + abs(p[1] - ghost_pos[1])
+            )
+            power_dist = abs(nearest_power[0] - ghost_pos[0]) + abs(nearest_power[1] - ghost_pos[1])
+            power_dist_norm = min(power_dist / max(diag, 1.0), 1.0)
+        else:
+            power_dist_norm = 0.0
+        pacman_powered = 1.0 if any(game_state['ghost_vulnerable']) else 0.0
+        ghost_one_hot = [1.0 if idx == ghost_id else 0.0 for idx in range(4)]
+        teammate_distances = []
+        for idx, other in enumerate(ghosts):
+            if idx == ghost_id:
+                continue
+            teammate_distances.append(abs(other[0] - pacman[0]) + abs(other[1] - pacman[1]))
+        avg_teammate_dist = np.mean(teammate_distances) if teammate_distances else manhattan
+        avg_teammate_dist_norm = min(avg_teammate_dist / max(diag, 1.0), 1.0)
+        features = local_grid + [
+            rel_row,
+            rel_col,
+            manhattan_norm,
+            visible_flag,
+            visible_distance_norm,
+            vel_row,
+            vel_col,
+            power_dist_norm,
+            pacman_powered,
+            vulnerable
+        ] + ghost_one_hot + [avg_teammate_dist_norm]
+        return np.array(features, dtype=np.float32)
     
     def get_global_state(self, game_state):
-        """Get global state for mixing network"""
+        """Global state for mixer with hunger, pellet density, and spread summaries"""
         pacman = game_state['pacman']
         ghosts = game_state['ghosts']
-        
-        # Average ghost position
-        avg_ghost_pos = np.mean(ghosts, axis=0)
-        
-        # Pacman position normalized
-        pacman_norm = [pacman[0] / 31.0, pacman[1] / 28.0]
-        
-        # Average distance to pacman
-        avg_dist = np.mean([abs(g[0] - pacman[0]) + abs(g[1] - pacman[1]) for g in ghosts]) / 20.0
-        
-        # Ghost spread (how dispersed they are)
-        ghost_spread = np.std([g[0] for g in ghosts] + [g[1] for g in ghosts]) / 10.0
-        
-        # Number of vulnerable ghosts
-        num_vulnerable = sum(game_state['ghost_vulnerable']) / 4.0
-        
-        # Pellets remaining
-        pellets_remaining = (len(game_state['pellets']) + len(game_state['power_pellets'])) / 200.0
-        
+        height, width, diag = _get_maze_dimensions(game_state)
+        pacman_row_norm = pacman[0] / max(height - 1, 1)
+        pacman_col_norm = pacman[1] / max(width - 1, 1)
+        avg_ghost_row = np.mean([g[0] for g in ghosts]) / max(height - 1, 1)
+        avg_ghost_col = np.mean([g[1] for g in ghosts]) / max(width - 1, 1)
+        distances = [abs(g[0] - pacman[0]) + abs(g[1] - pacman[1]) for g in ghosts]
+        mean_dist_norm = min(np.mean(distances) / max(diag, 1.0), 1.0) if distances else 0.0
+        std_dist_norm = min(np.std(distances) / max(diag, 1.0), 1.0) if len(distances) > 1 else 0.0
+        vel_row, vel_col = _normalize_velocity(game_state.get('pacman_velocity', (0, 0)))
+        hunger_ratio, steps_ratio, score_freeze_ratio, unique_ratio = _extract_hunger_features(game_state)
+        pellet_ratio, power_ratio = _pellet_progress_features(game_state)
+        vulnerability_fraction = float(np.mean(game_state['ghost_vulnerable'])) if game_state['ghost_vulnerable'] else 0.0
+        pairwise = []
+        for idx, g1 in enumerate(ghosts):
+            for jdx, g2 in enumerate(ghosts):
+                if jdx <= idx:
+                    continue
+                pairwise.append(abs(g1[0] - g2[0]) + abs(g1[1] - g2[1]))
+        pairwise_mean = np.mean(pairwise) if pairwise else 0.0
+        pairwise_norm = min(pairwise_mean / max(diag, 1.0), 1.0)
+        pellets = list(game_state.get('pellets', set()) or [])
+        power_pellets = list(game_state.get('power_pellets', set()) or [])
+        all_food = pellets + power_pellets
+        total_food = len(all_food)
+        top_half = _safe_ratio(sum(1 for cell in all_food if cell[0] < height / 2), total_food)
+        left_half = _safe_ratio(sum(1 for cell in all_food if cell[1] < width / 2), total_food)
         return np.array([
-            pacman_norm[0], pacman_norm[1],
-            avg_ghost_pos[0] / 31.0, avg_ghost_pos[1] / 28.0,
-            avg_dist, ghost_spread, num_vulnerable, pellets_remaining,
-            0, 0  # Padding to make it 10-dim
+            pacman_row_norm,
+            pacman_col_norm,
+            avg_ghost_row,
+            avg_ghost_col,
+            mean_dist_norm,
+            std_dist_norm,
+            vel_row,
+            vel_col,
+            hunger_ratio,
+            steps_ratio,
+            score_freeze_ratio,
+            pellet_ratio,
+            power_ratio,
+            unique_ratio,
+            vulnerability_fraction,
+            pairwise_norm,
+            top_half,
+            left_half
         ], dtype=np.float32)
     
     def get_actions(self, game_state):
@@ -747,7 +930,7 @@ class GhostTeam:
         next_global_state = self.get_global_state(next_game_state)
         
         self.qmix.store_transition(states, actions, reward, next_states, done, global_state, next_global_state)
-        self.qmix.update()
+        self.qmix.update(done=done)
         
         self.update_counter += 1
         if self.update_counter % self.target_update_freq == 0:

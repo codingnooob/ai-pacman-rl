@@ -1,0 +1,76 @@
+{
+  "episode_results": [
+    {
+      "episode_length": 500,
+      "natural_ending": false,
+      "movement_rate": 0.556,
+      "position_diversity": 0.08,
+      "action_diversity": 1.0,
+      "pellets_remaining": 254,
+      "pellet_collection_rate": -0.012,
+      "final_reward": -0.1,
+      "movement_pattern": "Moderate movement",
+      "evasion_score": "Survival-focused"
+    },
+    {
+      "episode_length": 374,
+      "natural_ending": true,
+      "movement_rate": 0.5401069518716578,
+      "position_diversity": 0.0855614973262032,
+      "action_diversity": 1.0,
+      "pellets_remaining": 262,
+      "pellet_collection_rate": -0.0374331550802139,
+      "final_reward": -500,
+      "movement_pattern": "Moderate movement",
+      "evasion_score": "Survival-focused"
+    },
+    {
+      "episode_length": 113,
+      "natural_ending": true,
+      "movement_rate": 0.5309734513274337,
+      "position_diversity": 0.18584070796460178,
+      "action_diversity": 1.0,
+      "pellets_remaining": 272,
+      "pellet_collection_rate": -0.21238938053097345,
+      "final_reward": -500,
+      "movement_pattern": "Moderate movement",
+      "evasion_score": "Survival-focused"
+    },
+    {
+      "episode_length": 237,
+      "natural_ending": true,
+      "movement_rate": 0.5527426160337553,
+      "position_diversity": 0.16455696202531644,
+      "action_diversity": 1.0,
+      "pellets_remaining": 255,
+      "pellet_collection_rate": -0.029535864978902954,
+      "final_reward": -500,
+      "movement_pattern": "Moderate movement",
+      "evasion_score": "Survival-focused"
+    },
+    {
+      "episode_length": 500,
+      "natural_ending": false,
+      "movement_rate": 0.554,
+      "position_diversity": 0.106,
+      "action_diversity": 1.0,
+      "pellets_remaining": 241,
+      "pellet_collection_rate": 0.014,
+      "final_reward": -0.1,
+      "movement_pattern": "Moderate movement",
+      "evasion_score": "Mixed behavior"
+    }
+  ],
+  "optimization_analysis": {
+    "episode_length": 1000,
+    "survival_focus": "False",
+    "primary_objective": "Evasion-focused",
+    "avg_ghost_distance": 13.446,
+    "avg_food_distance": 3.244
+  },
+  "key_findings": {
+    "extended_episodes": true,
+    "rare_natural_endings": false,
+    "survival_prioritized": true
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "validation_result": "partial",
+  "test_type": "extended_training_simulation",
+  "episodes_simulated": 800,
+  "key_finding": "Low epsilon correlates with minimal movement in extended sessions"
+}

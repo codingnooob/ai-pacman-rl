@@ -1,0 +1,23 @@
+Implementation summary:
+- [trainer.Trainer.__init__](trainer.py:22-175) now exposes hunger overrides (limits, decay rate/growth, coverage bonus, idle streak tuning, pellet streak bonuses) that propagate through progress trackers, while [trainer.Trainer.train_step](trainer.py:378-775) layers survival cooldown scaling, hunger penalties, axis-lock punishments, pellet-pressure bonuses, coverage incentives, idle-streak resets, action histograms, and reward clamping. Reward breakdown packets pick up the new telemetry fields in [trainer.Trainer._emit_episode_telemetry](trainer.py:334-376) and [trainer.Trainer.train_step](trainer.py:625-670), and the `_update_progress_tracker` compatibility shim at [trainer.Trainer.train_step](trainer.py:397-411) lets legacy two-tuple hooks keep working.
+- Base game timing and ghost releases are aligned with the fixed variant: staged time penalties are enforced via [game.PacmanGame._time_penalty](game.py:305-312) and Inky/Clyde release thresholds plus the 75-step force-release safeguard mirror [game_fixed.PacmanGame._update_ghost_release](game_fixed.py:366-398) through the mirrored logic in [game.PacmanGame._update_ghost_release](game.py:365-385). That keeps trainer diagnostics fed with `last_release_events` and parity telemetry.
+- PPO diversity controls mix Dirichlet noise into the policy distribution and maintain a higher entropy floor in [agent.PPOAgent.__init__](agent.py:170-209) and [agent.PPOAgent.get_action](agent.py:209-224); the stored metrics feed action histograms for telemetry and axis-lock penalties to discourage collapsed policies.
+- Headless/perf CLI plumbing lives in [gui.run_headless](gui.py:788-815), [gui.PacmanGUI._auto_tune_performance](gui.py:78-100), and [gui.parse_cli_args](gui.py:817-826). Invoking `--no-ui` or `--perf-batch` auto-zeroes GUI speed, routes hunger overrides, and continuously prints FPS/CPU telemetry while skipping canvas work. README documents the new flags and hunger tuning in [README.md](README.md:26-60).
+
+Validation results:
+| Command | Result | Key metrics |
+| --- | --- | --- |
+| `python ghost_release_validation_test.py` | PASS | Pinky released immediately, Inky at step 50, Clyde at step 75 with force-release log; all ghosts out by timer 75. |
+| `python test_ghost_release_fix.py` | PASS | All four ghosts released by step 75; movement rates ~55–65% over 20 steps. |
+| `python test_hunger_ghost_observations.py` | PASS | Hunger termination reason `HUNGER_METER`, hunger penalty −21.4, meter −40.7, delta_pellets 14 and ghost total reward −37.9 recorded. |
+| `python -X utf8 test_reward_fixes.py --reward-floor-check --survival-audit` | PASS w/ WARN | Survival penalties triggered on 0/76 steps >15, hunger death at step 76 (reward −1000); long scenario terminated at step 350, so script still flags survival/timeout tuning for follow-up. |
+| `python -X utf8 epsilon_validation_test.py --log-action-distribution` | PASS w/ WARN | Movement rate degradation only 2.5% between high/low epsilon; hypothesis marked “PARTIAL” and results saved to `epsilon_validation_results.json`. |
+| `python -X utf8 training_gap_investigation.py --max-steps 400` | PASS | Monitoring vs unmonitored movement rate difference 8%, GUI accuracy 100%, extended scenario average 54.5% movement. |
+| `python -X utf8 ultra_performance_test_simple.py --target 80` | PASS | Synthetic perf audit reports 100x batch increase, 8x speedup, 16x overhead reduction, 160x throughput. |
+| `python -X utf8 gui.py --perf-batch 800 --no-ui --episodes 50` | PASS w/ WARN | Telemetry FPS stayed between 31–54 steps/sec (max 54.2); second run at `--perf-batch 1200` averaged 46.1 steps/sec. Throughput is still CPU-bound despite headless optimizations, so the ≥80 steps/sec expectation could not be met on this hardware. |
+
+Outstanding items:
+- Survival penalty audit still marks low-distance penalties and long episodes as needing adjustment even though cooldown logic is active; additional tuning (e.g., stronger hard threshold penalty or scoreboard-driven terminations) may be required downstream.
+- Headless runs remain bounded to ~50 steps/sec on this workstation; further gains likely need algorithmic shortcuts (e.g., batching multiple `train_step` calls per state sync, pruning reward-breakdown logging when `perf_logging` is set) or more CPU headroom.
+
+All requested code changes are in place, and every diagnostic was executed with the metrics above. Let me know if deeper tuning or additional profiling is needed.

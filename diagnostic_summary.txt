@@ -1,0 +1,21 @@
+AI Pacman RL Diagnostic Results Summary
+=======================================
+
+Test Results (300 steps across 3 episodes):
+- Movement Rate: 55.3% (166/300 steps involved movement)
+- Penalty Pressure: 0.100 (below 0.3 threshold)
+- Base Rewards: 1.381 (very positive)
+
+HYPOTHESIS VALIDATION:
+- High penalty pressure (>0.3): FALSE (0.100)
+- Low movement rate (<30%): FALSE (55.3%)
+
+CONCLUSION: Primary hypothesis REJECTED
+The issue is NOT excessive reward penalties.
+
+ALTERNATIVE ROOT CAUSES TO INVESTIGATE:
+1. Terminal output interpretation - user may be misreading logs
+2. Training vs inference behavior differences
+3. Long-term training degradation (episodes 1000+)
+4. Epsilon decay causing exploration loss over time
+5. GUI visualization lag vs actual agent behavior

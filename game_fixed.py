@@ -201,7 +201,9 @@ class PacmanGame:
         
         self.steps += 1
         self.game_timer += 1
-        reward = -self._time_penalty()
+        
+        # FIXED: Increased base reward and added survival penalty
+        reward = -1.0  # Stronger time penalty to discourage excessive survival
         progress_made = False
         
         # Move Pacman
@@ -217,19 +219,19 @@ class PacmanGame:
         self.prev_pacman_pos = tuple(self.pacman_pos)
         pacman_tuple = tuple(self.pacman_pos)
         
-        # Check pellet collection
+        # Check pellet collection - STRONGER GOAL INCENTIVES
         if pacman_tuple in self.pellets:
             self.pellets.remove(pacman_tuple)
             self.score += 10
-            reward = 10
+            reward = 50  # Increased from 10 to strongly incentivize goal completion
             self.pellets_eaten += 1
             progress_made = True
         
-        # Check power pellet
+        # Check power pellet - ENHANCED POWER PELLET REWARD
         if pacman_tuple in self.power_pellets:
             self.power_pellets.remove(pacman_tuple)
             self.score += 50
-            reward = 50
+            reward = 200  # Increased from 50
             self.ghost_vulnerable = [True] * 4
             self.vulnerable_timer = self.vulnerable_duration
             self.ghost_eaten_count = 0
@@ -265,8 +267,8 @@ class PacmanGame:
         for i, ghost in enumerate(self.ghosts):
             if tuple(ghost) == pacman_tuple:
                 if self.ghost_vulnerable[i]:
-                    # Eat ghost
-                    ghost_points = 200 * (2 ** self.ghost_eaten_count)
+                    # Eat ghost - ENHANCED GHOST EATING REWARD
+                    ghost_points = 400 * (2 ** self.ghost_eaten_count)  # Increased from 200
                     self.score += ghost_points
                     reward = ghost_points
                     self.ghost_eaten_count += 1
@@ -284,33 +286,25 @@ class PacmanGame:
                     if self.ghost_released[i]:
                         self.done = True
                         self.termination_reason = 'GHOST_COLLISION'
-                        reward = -500
+                        reward = -1000  # Increased penalty for losing
                         return self.get_state(), reward, True
         
-        # Win condition
+        # Win condition - ENHANCED WIN REWARD
         if len(self.pellets) == 0 and len(self.power_pellets) == 0:
             self.done = True
             self.termination_reason = 'PACMAN_WIN'
-            reward = 1000
+            reward = 2000  # Doubled win reward to strongly incentivize completion
             progress_made = True
-        
-        # Timeout
-        if self.steps > 5000:
-            self.done = True
-            self.termination_reason = 'TIMEOUT'
+            
+            # Add efficiency bonus for faster completion
+            if self.steps < 1000:
+                efficiency_bonus = (1000 - self.steps) * 0.1  # Small bonus for speed
+                reward += efficiency_bonus
         
         self._update_internal_progress(progress_made)
         return self.get_state(), reward, self.done
-    
-    def _time_penalty(self):
-        if self.steps >= 400:
-            return 0.8
-        if self.steps >= 275:
-            return 0.5
-        if self.steps >= 150:
-            return 0.25
-        return 0.1
 
+        
     def _update_internal_progress(self, progress_made):
         if progress_made:
             self.steps_since_progress = 0
@@ -319,16 +313,36 @@ class PacmanGame:
             self.steps_since_progress += 1
             self.score_freeze_steps += 1
         self._last_score_snapshot = self.score
-    
+
+
     def update_hunger_stats(self, stats):
         self.steps_since_progress = stats.get('steps_since_progress', getattr(self, 'steps_since_progress', 0))
         self.score_freeze_steps = stats.get('score_freeze_steps', getattr(self, 'score_freeze_steps', 0))
         self.hunger_meter = stats.get('hunger_meter', getattr(self, 'hunger_meter', 0.0))
         self.unique_tiles = stats.get('unique_tiles', getattr(self, 'unique_tiles', 0))
-    
+
     def force_hunger_termination(self, reason='HUNGER'):
+        """Forcefully end the episode due to hunger-related violations.
+
+        Mirrors the signature of ``step`` so callers can treat this as a
+        terminal transition without duplicating logic elsewhere.
+        """
         self.done = True
         self.termination_reason = reason or 'HUNGER'
+
+        reward = None
+        if hasattr(self, 'hunger_config'):
+            reward = self.hunger_config.get('hunger_termination_reward')
+        if reward is None and hasattr(self, 'hunger_config_snapshot'):
+            reward = self.hunger_config_snapshot.get('hunger_termination_reward')
+        if reward is None:
+            reward = -750.0  # Fallback to default trainer penalty
+
+        # ``self.score`` tracks arcade points, so we do not mutate it here to
+        # avoid double-counting negative penalties. The trainer already applies
+        # the hunger termination reward to the learning signal.
+        state = self.get_state()
+        return state, reward, self.done
     
     def _move(self, pos, action):
         new_pos = pos.copy()
@@ -367,19 +381,18 @@ class PacmanGame:
         center_x, center_y = self.width // 2, self.height // 2
         self.last_release_events = []
         
-        # Pinky: immediate or 5 seconds
+        # Pinky: immediate or 5 seconds (unchanged)
         if not self.ghost_released[1] and (self.pellets_eaten >= 0 or self.game_timer >= 150):
             self._release_ghost_from_house(1, center_x, center_y, 'pinky_threshold')
         
-        # Inky: reduced threshold (align with fixed game)
+        # Inky: FIXED - 5 pellets or ~1.7 seconds (reduced from 30/300)
         if not self.ghost_released[2] and (self.pellets_eaten >= 5 or self.game_timer >= 50):
             self._release_ghost_from_house(2, center_x, center_y, 'inky_threshold')
         
-        # Clyde: reduced threshold (align with fixed game)
+        # Clyde: FIXED - 10 pellets or ~3.3 seconds (reduced from 60/450)
         if not self.ghost_released[3] and (self.pellets_eaten >= 10 or self.game_timer >= 100):
             self._release_ghost_from_house(3, center_x, center_y, 'clyde_threshold')
         
-        # Force-release safeguard to prevent paralysis
         if self.game_timer >= 75:
             for idx in range(1, 4):
                 self._release_ghost_from_house(idx, center_x, center_y, 'force_timer')

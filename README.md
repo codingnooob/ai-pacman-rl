@@ -48,6 +48,21 @@ pip install -r requirements.txt
 python gui.py
 ```
 
+### Advanced CLI Options
+
+The GUI now supports headless ultra-performance runs and hunger tuning directly from the command line:
+
+```bash
+python gui.py --no-ui --perf-batch 800 --episodes 50 --hunger-limit -250
+```
+
+* `--no-ui` runs training headlessly without rendering.
+* `--perf-batch` overrides the ultra performance batch size (default auto-tuned).
+* `--episodes` caps how many episodes to execute before exiting headless mode.
+* `--hunger-limit`, `--hunger-threshold`, `--hunger-decay-rate`, and `--hunger-growth` override the hunger configuration without editing code.
+
+Standard GUI runs still support these flags, allowing you to experiment with hunger tuning while keeping the visual interface active.
+
 ## How It Works
 
 ### Pacman (PPO with LSTM)
